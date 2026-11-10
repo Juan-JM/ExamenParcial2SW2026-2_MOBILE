@@ -6,6 +6,7 @@ import '../api_client.dart';
 import '../models.dart';
 import '../realtime.dart';
 import '../theme.dart';
+import '../voice.dart';
 import '../widgets/common.dart';
 import '../widgets/diagram_canvas.dart';
 import 'format.dart';
@@ -332,8 +333,53 @@ class _AskTab extends StatefulWidget {
 
 class _AskTabState extends State<_AskTab> {
   final _input = TextEditingController();
+  final _voice = NovaVoice.instance;
   bool _sending = false;
   String? _error;
+
+  /// Respuestas ya vistas: solo se lee en voz alta lo que llega después de abrir.
+  late final Set<String> _heard = widget.messages
+      .where((m) => m.role == 'assistant' && m.displayText.isNotEmpty)
+      .map((m) => m.id)
+      .toSet();
+
+  @override
+  void didUpdateWidget(_AskTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+
+    final mine = widget.messages.where((m) => m.authorId == widget.currentUserId).map((m) => m.id).toSet();
+    ChatMessage? toSpeak;
+
+    for (final message in widget.messages) {
+      if (message.role != 'assistant' || message.displayText.isEmpty || _heard.contains(message.id)) continue;
+      _heard.add(message.id);
+      // Nova lee lo que te responde a vos, no lo que le contesta a otro del equipo.
+      if (mine.contains(message.replyTo)) toSpeak = message;
+    }
+
+    if (toSpeak != null && _voice.enabled.value) _voice.speak(toSpeak.id, toSpeak.displayText);
+  }
+
+  Future<void> _toggleMic() async {
+    if (_voice.listening.value) {
+      await _voice.stopListening();
+      return;
+    }
+
+    setState(() => _error = null);
+    final started = await _voice.listen(
+      onWords: (words) {
+        _input.value = TextEditingValue(text: words, selection: TextSelection.collapsed(offset: words.length));
+      },
+      onDone: (words) {
+        if (words.isNotEmpty) _send(words);
+      },
+    );
+
+    if (!started && mounted) {
+      setState(() => _error = 'No se pudo usar el micrófono. Revisa el permiso en Ajustes.');
+    }
+  }
 
   static const _suggestions = [
     '¿Qué avanzaron hoy y qué hizo cada uno?',
@@ -343,6 +389,8 @@ class _AskTabState extends State<_AskTab> {
 
   @override
   void dispose() {
+    _voice.stopSpeaking();
+    _voice.stopListening();
     _input.dispose();
     super.dispose();
   }
@@ -358,7 +406,7 @@ class _AskTabState extends State<_AskTab> {
 
     try {
       await widget.onAsk(text);
-      if (preset == null) _input.clear();
+      _input.clear();
     } on ApiException catch (e) {
       setState(() => _error = e.message);
     } finally {
@@ -398,6 +446,11 @@ class _AskTabState extends State<_AskTab> {
                   itemBuilder: (_, index) => _Bubble(
                     message: messages[index],
                     mine: messages[index].authorId == widget.currentUserId,
+                    onTap: messages[index].role == 'assistant'
+                        ? () => _voice.speaking.value == messages[index].id
+                              ? _voice.stopSpeaking()
+                              : _voice.speak(messages[index].id, messages[index].displayText)
+                        : null,
                   ),
                 ),
         ),
@@ -423,16 +476,18 @@ class _AskTabState extends State<_AskTab> {
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: const EdgeInsets.symmetric(horizontal: 14),
-            itemCount: _suggestions.length,
+            itemCount: _suggestions.length + 1,
             separatorBuilder: (_, _) => const SizedBox(width: 8),
-            itemBuilder: (_, index) => ActionChip(
-              label: Text(_suggestions[index]),
-              onPressed: _sending ? null : () => _send(_suggestions[index]),
-              backgroundColor: AppColors.surface,
-              side: const BorderSide(color: AppColors.line),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
-              labelStyle: const TextStyle(fontSize: 13, color: AppColors.text),
-            ),
+            itemBuilder: (_, index) => index == 0
+                ? _VoiceToggle(voice: _voice, agentName: widget.agentName)
+                : ActionChip(
+                    label: Text(_suggestions[index - 1]),
+                    onPressed: _sending ? null : () => _send(_suggestions[index - 1]),
+                    backgroundColor: AppColors.surface,
+                    side: const BorderSide(color: AppColors.line),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+                    labelStyle: const TextStyle(fontSize: 13, color: AppColors.text),
+                  ),
           ),
         ),
         Container(
@@ -449,7 +504,7 @@ class _AskTabState extends State<_AskTab> {
                   textInputAction: TextInputAction.send,
                   onSubmitted: (_) => _send(),
                   decoration: InputDecoration(
-                    hintText: 'Pregúntale a ${widget.agentName}',
+                    hintText: _voice.listening.value ? 'Te escucho…' : 'Pregúntale a ${widget.agentName}',
                     counterText: '',
                     isDense: true,
                     contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
@@ -459,7 +514,12 @@ class _AskTabState extends State<_AskTab> {
                   ),
                 ),
               ),
-              const SizedBox(width: 8),
+              const SizedBox(width: 6),
+              ValueListenableBuilder<bool>(
+                valueListenable: _voice.listening,
+                builder: (_, listening, _) => _MicButton(listening: listening, onPressed: _sending ? null : _toggleMic),
+              ),
+              const SizedBox(width: 6),
               IconButton.filled(
                 tooltip: 'Enviar',
                 onPressed: _sending ? null : _send,
@@ -474,11 +534,110 @@ class _AskTabState extends State<_AskTab> {
   }
 }
 
+/// Parlante: si Nova lee sus respuestas en voz alta. Apagarlo corta lo que esté diciendo.
+class _VoiceToggle extends StatelessWidget {
+  const _VoiceToggle({required this.voice, required this.agentName});
+
+  final NovaVoice voice;
+  final String agentName;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<bool>(
+      valueListenable: voice.enabled,
+      builder: (_, on, _) => FilterChip(
+        selected: on,
+        showCheckmark: false,
+        avatar: Icon(on ? Icons.volume_up_rounded : Icons.volume_off_rounded, size: 18, color: on ? Colors.white : AppColors.muted),
+        label: Text(on ? 'Voz' : 'Sin voz'),
+        tooltip: on ? 'Silenciar a $agentName' : '$agentName lee sus respuestas',
+        onSelected: (value) {
+          voice.enabled.value = value;
+          if (!value) voice.stopSpeaking();
+        },
+        selectedColor: AppColors.accent,
+        backgroundColor: AppColors.surface,
+        side: BorderSide(color: on ? AppColors.accent : AppColors.line),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(999)),
+        labelStyle: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: on ? Colors.white : AppColors.text),
+      ),
+    );
+  }
+}
+
+/// Micrófono: mientras escucha se pone rojo y late; tocarlo de nuevo deja de escuchar.
+class _MicButton extends StatefulWidget {
+  const _MicButton({required this.listening, required this.onPressed});
+
+  final bool listening;
+  final VoidCallback? onPressed;
+
+  @override
+  State<_MicButton> createState() => _MicButtonState();
+}
+
+class _MicButtonState extends State<_MicButton> with SingleTickerProviderStateMixin {
+  late final _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100));
+
+  @override
+  void didUpdateWidget(_MicButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.listening && !_pulse.isAnimating) _pulse.repeat();
+    if (!widget.listening) _pulse.reset();
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const red = Color(0xFFEF4444);
+
+    return SizedBox(
+      width: 48,
+      height: 48,
+      child: Stack(
+        alignment: Alignment.center,
+        clipBehavior: Clip.none,
+        children: [
+          if (widget.listening)
+            AnimatedBuilder(
+              animation: _pulse,
+              builder: (_, _) => Container(
+                width: 48 + 16 * _pulse.value,
+                height: 48 + 16 * _pulse.value,
+                decoration: BoxDecoration(shape: BoxShape.circle, color: red.withValues(alpha: 0.3 * (1 - _pulse.value))),
+              ),
+            ),
+          IconButton.filled(
+            tooltip: widget.listening ? 'Dejar de escuchar' : 'Hablar',
+            onPressed: widget.onPressed,
+            style: IconButton.styleFrom(
+              backgroundColor: widget.listening ? red : AppColors.accentSoft,
+              minimumSize: const Size(48, 48),
+            ),
+            icon: Icon(
+              widget.listening ? Icons.stop_rounded : Icons.mic_none_rounded,
+              color: widget.listening ? Colors.white : AppColors.accent,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _Bubble extends StatelessWidget {
-  const _Bubble({required this.message, required this.mine});
+  const _Bubble({required this.message, required this.mine, this.onTap});
 
   final ChatMessage message;
   final bool mine;
+
+  /// En las respuestas de la IA: leer en voz alta o callar.
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -495,7 +654,9 @@ class _Bubble extends StatelessWidget {
 
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
         constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.8),
@@ -519,6 +680,16 @@ class _Bubble extends StatelessWidget {
                   const Icon(Icons.auto_awesome, size: 13, color: AppColors.accent),
                   const SizedBox(width: 4),
                 ],
+                if (assistant)
+                  ValueListenableBuilder<String?>(
+                    valueListenable: NovaVoice.instance.speaking,
+                    builder: (_, id, _) => id == message.id
+                        ? const Padding(
+                            padding: EdgeInsets.only(right: 4),
+                            child: Icon(Icons.graphic_eq_rounded, size: 14, color: AppColors.accent),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
                 Text(
                   [message.authorName, if (date != null) formatTime(date)].join(' · '),
                   style: TextStyle(
@@ -533,6 +704,7 @@ class _Bubble extends StatelessWidget {
             Text(message.displayText, style: TextStyle(color: foreground, height: 1.4)),
           ],
         ),
+      ),
       ),
     );
   }
